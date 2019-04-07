@@ -2,27 +2,10 @@
 package main
 
 import (
-	//	"crypto/md5"
-	//	"encoding/hex"
-	"hash"
-	//	"io"
-	//	"log"
-	"strings"
-
-	//	"errors"
-
 	"flag"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io"
 )
-
-//func init() {
-//	flag.StringVar(&from, "gopher_type", defaultGopher, usage)
-//	flag.StringVar(&gopherType, "g", defaultGopher, usage+" (shorthand)")
-//
-//	wordPtr := flag.String("word", "foo", "a string")
-//}
 
 type operationType int
 
@@ -30,7 +13,15 @@ const (
 	COPY operationType = 0 + iota
 	RENAME
 	REMOVE
+	MKDIR
 )
+
+var operationsList = map[operationType]string{
+	COPY:   "COPY",
+	RENAME: "RENAME",
+	REMOVE: "REMOVE",
+	MKDIR:  "MKDIR",
+}
 
 type operation struct {
 	srcPath  string
@@ -39,89 +30,91 @@ type operation struct {
 }
 
 func (o operationType) String() string {
-	return [...]string{"COPY", "RENAME", "REMOVE"}[o]
+	return operationsList[o]
 }
 
-type pathInfo struct {
-	fullPath string
-	path     string
-	fileInfo os.FileInfo
-	hash     hash.Hash
-	readed   bool
-}
-
-func (p *pathInfo) compare(toP *pathInfo) bool {
-	return p.fileInfo.Size() == toP.fileInfo.Size()
-}
-
-func loadPathInfos(location string) map[string]*pathInfo {
-
-	storage := make(map[string]*pathInfo)
-
-	var visit = func(fullPath string, fileInfo os.FileInfo, err error) error {
-
-		info := new(pathInfo)
-		info.fullPath = fullPath
-		info.path = strings.Replace(fullPath, location, "", -1)
-		info.fileInfo = fileInfo
-		info.readed = false
-
-		if !fileInfo.IsDir() {
-
-			//			f, err := os.Open(fullPath)
-			//			if err != nil {
-			//				return nil
-			//				log.Fatal(err)
-			//			}
-			//			defer f.Close()
-
-			//			h := md5.New()
-			//			if _, err := io.Copy(h, f); err != nil {
-			//				return nil
-			//				log.Fatal(err)
-			//			}
-
-			//			md5String := hex.EncodeToString(h.Sum(nil))
-			//
-			//			if _, ok := storage[md5String]; !ok {
-			//				storage[md5String] = make(map[string]*pathInfo)
-			//			}
-
-			storage[info.path] = info
-		}
-
-		return nil
-	}
-
-	filepath.Walk(location, visit)
-
-	return storage
-}
+var CompareService *PathInfoCompare
 
 func main() {
 	flag.Parse()
-	//	db, _ := buntdb.Open(":memory:")
-	//
-	//	err := db.Update(func(tx *buntdb.Tx) error {
-	//		_, _, err := tx.Set("mykey", "myvalue", nil)
-	//		return err
-	//	})
 
 	args := flag.Args()
 	len := len(args)
 	if len != 2 {
 		panic("Not fount from and to")
 	}
-	to := args[1]
-	toPathInfos := loadPathInfos(to)
-
 	from := args[0]
-	fromPathInfos := loadPathInfos(from)
+	fromIo := CreateLocalIo(from)
+	fromPathInfos := loadPathInfos(fromIo)
 
-	operations := make([]operation, 0)
+	to := args[1]
+	toIo := CreateLocalIo(to)
+	toPathInfos := loadPathInfos(toIo)
+
+	CompareService := new(PathInfoCompare)
+	CompareService.fromIo = fromIo
+	CompareService.toIo = toIo
+
+	typeOperations := buildOperations(fromPathInfos, toPathInfos, CompareService)
+
+	for _, operation := range typeOperations[REMOVE] {
+		toIo.Remove(operation.destPath)
+		fmt.Printf("%s -> %s : %s\n", operation.srcPath, operation.destPath, operation.otype.String())
+	}
+
+	for _, operation := range typeOperations[MKDIR] {
+		toIo.Mkdir(operation.destPath)
+		fmt.Printf("%s -> %s : %s\n", operation.srcPath, operation.destPath, operation.otype.String())
+	}
+
+	for _, operation := range typeOperations[RENAME] {
+		toIo.Rename(operation.srcPath, operation.destPath)
+		fmt.Printf("%s -> %s : %s\n", operation.srcPath, operation.destPath, operation.otype.String())
+	}
+
+	for _, operation := range typeOperations[COPY] {
+		reader := fromIo.FileReader(operation.srcPath)
+		writer := toIo.FileWriter(operation.destPath)
+
+		io.Copy(writer, reader)
+		fmt.Printf("%s -> %s : %s\n", operation.srcPath, operation.destPath, operation.otype.String())
+	}
+}
+
+func buildOperations(fromPathInfos, toPathInfos map[string]*pathInfo, CompareService *PathInfoCompare) map[operationType][]operation {
+	operations := make(map[operationType][]operation, 0)
+	for k, _ := range operationsList {
+		operations[k] = make([]operation, 0)
+	}
+
 	for fromPath, fromPathInfo := range fromPathInfos {
+		if fromPathInfo.fileInfo.IsDir() {
+			fromPathInfo.readed = true
+
+			if toPathInfo, ok := toPathInfos[fromPath]; ok {
+				if toPathInfo.fileInfo.IsDir() {
+					toPathInfo.readed = true
+					continue
+				}
+
+				op := new(operation)
+				op.srcPath = ""
+				op.destPath = fromPathInfo.path
+				op.otype = REMOVE
+				operations[op.otype] = append(operations[op.otype], *op)
+			}
+
+			op := new(operation)
+			op.srcPath = ""
+			op.destPath = fromPathInfo.path
+			op.otype = MKDIR
+			operations[op.otype] = append(operations[op.otype], *op)
+
+			continue
+		}
+
 		if toPathInfo, ok := toPathInfos[fromPath]; ok {
-			if fromPathInfo.compare(toPathInfo) {
+			if CompareService.compare(fromPathInfo, toPathInfo) {
 				fromPathInfo.readed = true
 				toPathInfo.readed = true
 
@@ -130,17 +123,21 @@ func main() {
 		}
 
 		for toPath, toPathInfo := range toPathInfos {
-			if fromPathInfo.compare(toPathInfo) {
+			if toPathInfo.fileInfo.IsDir() {
+				continue
+			}
+
+			if CompareService.compare(fromPathInfo, toPathInfo) {
 
 				fromPathInfo.readed = true
 				toPathInfo.readed = true
 
 				op := new(operation)
-				op.srcPath = fromPath
-				op.destPath = toPath
+				op.srcPath = toPath
+				op.destPath = fromPath
 				op.otype = RENAME
 
-				operations = append(operations, *op)
+				operations[op.otype] = append(operations[op.otype], *op)
 				continue
 			}
 		}
@@ -153,7 +150,7 @@ func main() {
 			op.destPath = fromPath
 			op.otype = COPY
 
-			operations = append(operations, *op)
+			operations[op.otype] = append(operations[op.otype], *op)
 		}
 	}
 
@@ -164,11 +161,9 @@ func main() {
 			op.destPath = toPath
 			op.otype = REMOVE
 
-			operations = append(operations, *op)
+			operations[op.otype] = append(operations[op.otype], *op)
 		}
 	}
 
-	for _, operation := range operations {
-		fmt.Printf("%s -> %s : %s\n", operation.srcPath, operation.destPath, operation.otype.String())
-	}
+	return operations
 }
